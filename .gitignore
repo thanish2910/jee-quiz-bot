@@ -1,0 +1,10 @@
+# Never upload these
+*.json
+!seed_questions.json
+!railway.json
+
+# Python
+__pycache__/
+*.pyc
+.env
+bot_images/
