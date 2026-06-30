@@ -51,7 +51,7 @@ Scoring (JEE Advanced pattern):
   Multi-correct:    +4 all correct | +3/+2/+1 partial (no wrong) | -2 any wrong
 """
 
-import os, json, random, logging, asyncio, io, tempfile, time, collections
+import os, json, random, logging, asyncio, io, tempfile, time, collections, base64, urllib.request, urllib.parse
 from datetime import datetime
 from typing import Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot, InputMediaPhoto
@@ -104,6 +104,19 @@ BAN_DURATION      = int(os.getenv("BAN_DURATION",      "300"))  # 5 minutes
 # Prevents the broadcast command from hitting Telegram's 30 msg/s limit.
 BROADCAST_DELAY = float(os.getenv("BROADCAST_DELAY", "0.05"))  # seconds between sends
 
+# ── GitHub Backup (optional but strongly recommended) ────────────
+# Backs up all data JSON files to a private GitHub repo nightly.
+# Setup:
+#   1. Create a NEW private repo on GitHub e.g. "jee-bot-data"
+#      (separate from your code repo — keeps data and code apart)
+#   2. Create a Personal Access Token with "repo" scope
+#      github.com → Settings → Developer settings → Personal access tokens
+#   3. Set the env vars below
+GITHUB_BACKUP_TOKEN  = os.getenv("GITHUB_BACKUP_TOKEN",  "")   # PAT with repo scope
+GITHUB_BACKUP_REPO   = os.getenv("GITHUB_BACKUP_REPO",   "")   # e.g. "yourname/jee-bot-data"
+GITHUB_BACKUP_BRANCH = os.getenv("GITHUB_BACKUP_BRANCH", "main")
+BACKUP_INTERVAL_HOURS = int(os.getenv("BACKUP_INTERVAL_HOURS", "6"))  # backup every 6 hours
+
 # ── Global suggestion cap ──────────────────────────────────────────
 # Prevents suggestion DB from growing unboundedly.
 MAX_SUGGESTIONS_TOTAL    = int(os.getenv("MAX_SUGGESTIONS_TOTAL",    "1000"))
@@ -111,6 +124,135 @@ MAX_SUGGESTIONS_PER_USER = int(os.getenv("MAX_SUGGESTIONS_PER_USER",  "10"))
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  GITHUB BACKUP ENGINE
+#
+#  Automatically backs up these files to a private GitHub repo:
+#    • added_questions.json   (admin-added questions)
+#    • suggested_questions.json
+#    • leaderboard.json
+#    • known_users.json
+#    • autopost_config.json
+#
+#  seed_questions.json is NOT backed up (it's hardcoded in the bot).
+#  Question images are NOT backed up (they're safe on Cloudinary).
+#
+#  To RESTORE after moving to a new platform:
+#    1. Clone or download your data repo
+#    2. Copy the JSON files to your new server's /data/ folder
+#    3. Start the bot — it picks them up automatically
+# ═══════════════════════════════════════════════════════════════════
+
+async def _github_upload_file(filename: str, content: str, token: str, repo: str, branch: str):
+    """
+    Upload (create or update) a single file in a GitHub repo via the REST API.
+    Uses only stdlib — no extra pip install needed.
+    """
+    api_url = f"https://api.github.com/repos/{repo}/contents/{filename}"
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept":        "application/vnd.github+json",
+        "Content-Type":  "application/json",
+        "User-Agent":    "JEEQuizBot-Backup/1.0",
+    }
+
+    # Get current file SHA (needed for updates — GitHub requires it)
+    sha = None
+    try:
+        req = urllib.request.Request(api_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            existing = json.loads(resp.read().decode())
+            sha = existing.get("sha")
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            raise   # 404 = file doesn't exist yet (first backup) — that's fine
+
+    # Build request body
+    body = {
+        "message": f"Auto-backup {filename} [{datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC]",
+        "content": base64.b64encode(content.encode("utf-8")).decode("utf-8"),
+        "branch":  branch,
+    }
+    if sha:
+        body["sha"] = sha   # required for updates
+
+    data = json.dumps(body).encode("utf-8")
+    req  = urllib.request.Request(api_url, data=data, headers=headers, method="PUT")
+
+    loop   = asyncio.get_event_loop()
+    result = await loop.run_in_executor(
+        None,
+        lambda: urllib.request.urlopen(req, timeout=15).read()
+    )
+    return json.loads(result)
+
+
+async def run_backup(bot=None):
+    """
+    Back up all data JSON files to GitHub.
+    Called by the scheduled job every BACKUP_INTERVAL_HOURS hours.
+    Also callable manually via /backup command.
+    Returns (success_count, fail_count, details_str).
+    """
+    if not GITHUB_BACKUP_TOKEN or not GITHUB_BACKUP_REPO:
+        return 0, 0, "GitHub backup not configured (GITHUB_BACKUP_TOKEN or GITHUB_BACKUP_REPO not set)."
+
+    # Files to back up: (env-var path, fallback name)
+    files_to_backup = [
+        (ADDED_FILE,     "added_questions.json"),
+        (SUGGESTED_FILE, "suggested_questions.json"),
+        (LEADERBOARD_FILE,"leaderboard.json"),
+        (KNOWN_USERS_FILE,"known_users.json"),
+        (AUTOPOST_FILE,  "autopost_config.json"),
+    ]
+
+    ok = 0; fail = 0; details = []
+    for filepath, fallback_name in files_to_backup:
+        # Determine the filename to store in GitHub (just the basename)
+        github_filename = os.path.basename(filepath) if filepath else fallback_name
+
+        # Read current file content
+        if not os.path.exists(filepath or ""):
+            details.append(f"⏭ {github_filename} — skipped (file not found)")
+            continue
+
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            await _github_upload_file(
+                github_filename, content,
+                GITHUB_BACKUP_TOKEN, GITHUB_BACKUP_REPO, GITHUB_BACKUP_BRANCH
+            )
+            ok += 1
+            details.append(f"✅ {github_filename}")
+            logger.info(f"Backup OK: {github_filename} → {GITHUB_BACKUP_REPO}")
+
+        except Exception as e:
+            fail += 1
+            details.append(f"❌ {github_filename} — {str(e)[:80]}")
+            logger.warning(f"Backup failed for {github_filename}: {e}")
+
+    return ok, fail, "\n".join(details)
+
+
+async def backup_job(context: ContextTypes.DEFAULT_TYPE):
+    """Scheduled job: runs every BACKUP_INTERVAL_HOURS hours."""
+    ok, fail, details = await run_backup()
+    if fail > 0:
+        # Notify admins silently if any backup failed
+        for aid in ADMIN_IDS:
+            try:
+                await context.bot.send_message(
+                    chat_id=aid,
+                    text=f"⚠️ *Backup report*\n\n{details}\n\n"
+                         f"✅ {ok} succeeded  |  ❌ {fail} failed",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1810,6 +1952,13 @@ async def cmd_setautopost(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return
     if not is_group_chat(update):
         await update.message.reply_text("⚠️ Use this command in a group chat."); return
+    if context.job_queue is None:
+        await update.message.reply_text(
+            "❌ Scheduling isn't available on this bot instance.\n"
+            "Admin needs to install: `pip install \"python-telegram-bot[job-queue]\"`",
+            parse_mode="Markdown",
+        )
+        return
     args = context.args
     if not args or not args[0].isdigit():
         await update.message.reply_text(
@@ -2459,6 +2608,71 @@ async def cmd_migrateimages(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  BACKUP / RESTORE COMMANDS
+# ═══════════════════════════════════════════════════════════════════
+
+async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /backup — Immediately back up all data files to GitHub.
+    Admin only. Use this before switching hosting platforms.
+    """
+    if not is_admin(update.effective_user.id): return
+    if await dm_only(update, "/backup"): return
+
+    if not GITHUB_BACKUP_TOKEN or not GITHUB_BACKUP_REPO:
+        await update.message.reply_text(
+            "⚠️ *GitHub backup not configured.*\n\n"
+            "Set these env variables:\n"
+            "`GITHUB_BACKUP_TOKEN` — GitHub Personal Access Token (repo scope)\n"
+            "`GITHUB_BACKUP_REPO`  — e.g. `yourname/jee-bot-data`\n\n"
+            "See setup instructions in the code comments.",
+            parse_mode="Markdown",
+        )
+        return
+
+    msg = await update.message.reply_text("⏳ Backing up to GitHub…")
+    ok, fail, details = await run_backup()
+    status = "✅ Backup complete!" if fail == 0 else f"⚠️ Backup finished with {fail} error(s)."
+    await msg.edit_text(
+        f"{status}\n\n{details}\n\n"
+        f"📦 Repo: `{GITHUB_BACKUP_REPO}`",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_restore_guide(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /restoreguide — Show step-by-step instructions for restoring data
+    on a new hosting platform.
+    """
+    if not is_admin(update.effective_user.id): return
+    if await dm_only(update, "/restoreguide"): return
+
+    text = (
+        "📦 *How to restore your bot data on a new platform*\n\n"
+        "*Step 1 — Download your backed-up data:*\n"
+        f"Go to github.com/{GITHUB_BACKUP_REPO or 'your-data-repo'}\n"
+        "Download these files:\n"
+        "  • `added_questions.json`\n"
+        "  • `suggested_questions.json`\n"
+        "  • `leaderboard.json`\n"
+        "  • `known_users.json`\n"
+        "  • `autopost_config.json`\n\n"
+        "*Step 2 — Set up new platform:*\n"
+        "Deploy `jee_quiz_bot.py` + `requirements.txt` as usual.\n\n"
+        "*Step 3 — Upload data files:*\n"
+        "Copy the downloaded JSON files to your new server's `/data/` folder\n"
+        "(or wherever your `ADDED_FILE`, `LEADERBOARD_FILE` etc. point to).\n\n"
+        "*Step 4 — Set env variables:*\n"
+        "Copy all your env variables from Railway to the new platform.\n\n"
+        "*Step 5 — Start the bot.*\n"
+        "It will automatically load all your questions, scores and settings.\n\n"
+        "✅ Your question images are already safe on Cloudinary — nothing to restore there."
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  MANUAL BAN MANAGEMENT  (admin commands)
 # ═══════════════════════════════════════════════════════════════════
 
@@ -2533,6 +2747,19 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
 
+    # ── Guard: JobQueue requires the [job-queue] extra ────────────────
+    # Without it, /setautopost, autopost in groups, and the GitHub backup
+    # scheduler silently do nothing. Fail loudly instead so it's obvious.
+    if app.job_queue is None:
+        print(
+            "❌ JobQueue is not available!\n"
+            "   Autopost and scheduled backups will NOT work.\n"
+            "   Fix: pip install \"python-telegram-bot[job-queue]\"\n"
+            "   (update requirements.txt to: python-telegram-bot[job-queue]==21.6)"
+        )
+    else:
+        logger.info("JobQueue available — autopost & scheduled backup will work.")
+
     # User commands
     app.add_handler(CommandHandler("start",       cmd_start))
     app.add_handler(CommandHandler("menu",        cmd_menu))
@@ -2565,6 +2792,8 @@ def main():
     app.add_handler(CommandHandler("ban",             cmd_ban))
     app.add_handler(CommandHandler("unban",           cmd_unban))
     app.add_handler(CommandHandler("banlist",         cmd_banlist))
+    app.add_handler(CommandHandler("backup",          cmd_backup))
+    app.add_handler(CommandHandler("restoreguide",    cmd_restore_guide))
 
     # Callbacks and messages
     app.add_handler(CallbackQueryHandler(handle_callback))
@@ -2573,6 +2802,16 @@ def main():
 
     # Restore autopost jobs from saved config
     app.post_init = restore_autopost_jobs
+
+    # Schedule automatic GitHub backup
+    if GITHUB_BACKUP_TOKEN and GITHUB_BACKUP_REPO:
+        app.job_queue.run_repeating(
+            backup_job,
+            interval=BACKUP_INTERVAL_HOURS * 3600,
+            first=60,   # first backup 60 seconds after startup
+            name="github_backup",
+        )
+        logger.info(f"GitHub backup scheduled every {BACKUP_INTERVAL_HOURS}h → {GITHUB_BACKUP_REPO}")
 
     logger.info(f"JEE Quiz Bot running. Seed: {len(SEED_DB)} | Added: {len(ADDED_DB)}")
     app.run_polling(drop_pending_updates=True)
